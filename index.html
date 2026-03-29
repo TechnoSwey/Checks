@@ -382,7 +382,7 @@
         BLACK_KING: 4
     };
 
-    // --- СЕТЕВОЙ МЕНЕДЖЕР (PeerJS) ---
+    // --- СЕТЕВОЙ МЕНЕДЖЕР (PeerJS) - ИСПРАВЛЕННЫЙ ---
     class NetworkManager {
         constructor(game) {
             this.game = game;
@@ -391,26 +391,38 @@
             this.myColor = null;
             this.isHost = false;
             this.gameStarted = false;
+            this.connectionReady = false;
         }
 
         init() {
-            this.peer = new Peer(null, {debug: 2});
+            this.peer = new Peer(null, {
+                debug: 2,
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                }
+            });
+            
             this.peer.on('open', (id) => {
                 console.log('My peer ID is: ' + id);
+                this.connectionReady = true;
             });
+            
             this.peer.on('connection', (conn) => {
                 if (this.conn) {
                     conn.close();
                     return;
                 }
+                
                 this.conn = conn;
                 this.setupConnection();
                 this.isHost = true;
                 this.myColor = 'white';
-                this.updateStatus("Игрок подключился! Игра начинается.", "connected");
-                this.game.startOnlineGame('white');
-                this.gameStarted = true;
+                this.updateStatus("Игрок подключился! Ожидаем подтверждения...", "waiting");
             });
+            
             this.peer.on('error', (err) => {
                 console.error(err);
                 this.updateStatus("Ошибка сети: " + err.type, "disconnected");
@@ -418,11 +430,12 @@
         }
 
         hostGame() {
-            if (!this.peer || !this.peer.id) {
+            if (!this.connectionReady) {
                 this.updateStatus("Инициализация сети...", "waiting");
                 setTimeout(() => this.hostGame(), 500);
                 return;
             }
+            
             document.getElementById('hostInfo').style.display = 'block';
             document.getElementById('joinInput').style.display = 'none';
             document.getElementById('myPeerId').innerText = this.peer.id;
@@ -433,27 +446,39 @@
         joinGame() {
             document.getElementById('hostInfo').style.display = 'none';
             document.getElementById('joinInput').style.display = 'block';
-            this.updateStatus("", "");
+            this.updateStatus("Введите ID соперника", "waiting");
         }
 
         connectToPeer() {
             const remoteId = document.getElementById('remotePeerId').value.trim();
-            if (!remoteId) return;
-            this.updateStatus("Подключение...", "waiting");
+            if (!remoteId) {
+                this.updateStatus("Введите ID для подключения", "disconnected");
+                return;
+            }
+            
+            this.updateStatus("Подключение к " + remoteId + "...", "waiting");
+            
             const conn = this.peer.connect(remoteId);
-
+            
             conn.on('open', () => {
+                console.log('Connected to peer');
                 this.conn = conn;
                 this.setupConnection();
                 this.isHost = false;
                 this.myColor = 'black';
-                this.updateStatus("Подключено! Ожидание начала игры...", "connected");
-                this.conn.send({type: 'ready'});
+                this.updateStatus("Подключено! Отправляем запрос на начало игры...", "connected");
+                
+                // Отправляем запрос на начало игры
+                setTimeout(() => {
+                    if (this.conn && this.conn.open) {
+                        this.conn.send({ type: 'request_start' });
+                    }
+                }, 500);
             });
-
+            
             conn.on('error', (err) => {
                 console.error('Connection error:', err);
-                this.updateStatus("Не удалось подключиться", "disconnected");
+                this.updateStatus("Не удалось подключиться к игроку", "disconnected");
             });
         }
 
@@ -461,49 +486,85 @@
             this.conn.on('data', (data) => {
                 this.handleData(data);
             });
-
+            
             this.conn.on('close', () => {
                 this.updateStatus("Соперник отключился", "disconnected");
                 this.conn = null;
                 this.game.isProcessing = true;
                 this.gameStarted = false;
             });
+            
+            this.conn.on('error', (err) => {
+                console.error('Connection error:', err);
+                this.updateStatus("Ошибка соединения", "disconnected");
+            });
         }
 
         handleData(data) {
+            console.log('Received data:', data.type);
+            
             if (data.type === 'move') {
-                this.game.receiveMove(data.move);
+                if (this.gameStarted) {
+                    this.game.receiveMove(data.move);
+                }
             } else if (data.type === 'restart') {
                 this.game.reset();
-            } else if (data.type === 'ready' && !this.isHost) {
-                this.game.startOnlineGame('black');
-                this.gameStarted = true;
+            } else if (data.type === 'request_start') {
+                // Клиент запрашивает начало игры
+                if (this.isHost && !this.gameStarted) {
+                    this.updateStatus("Соперник готов! Начинаем игру.", "connected");
+                    this.conn.send({ type: 'start_game', color: 'white' });
+                    this.game.startOnlineGame('white');
+                    this.gameStarted = true;
+                }
+            } else if (data.type === 'start_game') {
+                // Хост подтверждает начало игры
+                if (!this.isHost && !this.gameStarted) {
+                    this.updateStatus("Игра началась! Вы играете за черных.", "connected");
+                    this.game.startOnlineGame('black');
+                    this.gameStarted = true;
+                }
+            } else if (data.type === 'ready') {
+                // Подтверждение готовности
+                if (this.isHost && !this.gameStarted) {
+                    this.updateStatus("Соперник готов! Начинаем игру.", "connected");
+                    this.conn.send({ type: 'start_game', color: 'white' });
+                    this.game.startOnlineGame('white');
+                    this.gameStarted = true;
+                }
             }
         }
 
         sendMove(move) {
-            if (this.conn && this.conn.open && this.conn.peerConnection) {
-                this.conn.send({type: 'move', move: move});
-            } else {
-                console.warn('Cannot send move: connection not open');
-                this.updateStatus("Соединение потеряно", "disconnected");
+            if (this.conn && this.conn.open && this.gameStarted) {
+                this.conn.send({ type: 'move', move: move });
+                return true;
             }
+            console.warn('Cannot send move: connection not ready');
+            return false;
         }
 
         disconnect() {
-            if (this.conn) this.conn.close();
-            if (this.peer) this.peer.destroy();
+            if (this.conn) {
+                this.conn.close();
+            }
+            if (this.peer) {
+                this.peer.destroy();
+            }
             this.conn = null;
             this.peer = null;
             this.gameStarted = false;
+            this.connectionReady = false;
             document.getElementById('networkPanel').style.display = 'none';
             this.game.wrapper.classList.remove('mode-online');
         }
 
         updateStatus(msg, type) {
             const el = document.getElementById('connectionStatus');
-            el.innerText = msg;
-            el.className = 'connection-status status-' + type;
+            if (el) {
+                el.innerText = msg;
+                el.className = 'connection-status status-' + type;
+            }
         }
     }
 
@@ -553,6 +614,13 @@
             this.myColorOnline = color;
             this.reset();
             this.isProcessing = false;
+            this.isGameOver = false;
+            
+            if (color === 'white') {
+                this.updateStatus("Ход Белых (ваш ход)");
+            } else {
+                this.updateStatus("Ход Черных (ваш ход)");
+            }
         }
 
         init() {
@@ -593,8 +661,8 @@
         }
 
         reset() {
-            if (this.playType === 'online' && this.network.conn && this.network.conn.open) {
-                this.network.conn.send({type: 'restart'});
+            if (this.playType === 'online' && this.network.conn && this.network.conn.open && this.network.gameStarted) {
+                this.network.conn.send({ type: 'restart' });
                 setTimeout(() => {
                     this.init();
                     this.isProcessing = false;
@@ -637,6 +705,7 @@
             const moves = [];
             const isKing = (piece === CONSTANTS.WHITE_KING || piece === CONSTANTS.BLACK_KING);
             const color = this.getPieceColor(piece);
+            
             if (this.mode === 'russian') {
                 const directions = [[-1, -1], [-1, 1], [1, -1], [1, 1]];
                 directions.forEach(d => {
@@ -767,6 +836,7 @@
             if (this.isProcessing || this.isGameOver) return;
 
             if (this.playType === 'online') {
+                if (!this.network.gameStarted) return;
                 if ((this.turn === CONSTANTS.WHITE && this.myColorOnline !== 'white') ||
                     (this.turn === CONSTANTS.BLACK && this.myColorOnline !== 'black')) {
                     return;
@@ -916,7 +986,7 @@
                 if (msg.includes("Белых")) {
                     this.turnDot.style.background = "white";
                     this.turnDot.style.border = "1px solid #ccc";
-                } else {
+                } else if (msg.includes("Черных")) {
                     this.turnDot.style.background = "black";
                     this.turnDot.style.border = "1px solid #555";
                 }
@@ -1018,22 +1088,17 @@
             for (const move of moves) {
                 let score = 0;
 
-                // Бонус за взятие
                 if (move.isCapture) {
                     score += 10;
-
-                    // Дополнительный бонус за взятие дамкой
                     const piece = this.board[move.from.r][move.from.c];
                     const isKing = (piece === CONSTANTS.BLACK_KING);
                     if (isKing) score += 5;
                 }
 
-                // Бонус за продвижение в дамки
                 if (move.to.r === 7 && this.board[move.from.r][move.from.c] === CONSTANTS.BLACK) {
                     score += 8;
                 }
 
-                // Бонус за движение к центру
                 const centerDist = Math.abs(move.to.c - 3.5);
                 score += (4 - centerDist) * 0.5;
 
