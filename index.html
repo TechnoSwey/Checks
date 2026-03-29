@@ -388,29 +388,28 @@
             this.game = game;
             this.peer = null;
             this.conn = null;
-            this.myColor = null; // 'white' или 'black'
+            this.myColor = null;
             this.isHost = false;
+            this.gameStarted = false;
         }
 
         init() {
-            // Инициализация PeerJS (использует публичный сервер для рукопожатия)
             this.peer = new Peer(null, {debug: 2});
             this.peer.on('open', (id) => {
                 console.log('My peer ID is: ' + id);
             });
             this.peer.on('connection', (conn) => {
-                // Кто-то подключился к нам (мы Хост)
                 if (this.conn) {
                     conn.close();
                     return;
                 }
-                // Только одно соединение
                 this.conn = conn;
                 this.setupConnection();
                 this.isHost = true;
-                this.myColor = 'white'; // Хост всегда белый
+                this.myColor = 'white';
                 this.updateStatus("Игрок подключился! Игра начинается.", "connected");
                 this.game.startOnlineGame('white');
+                this.gameStarted = true;
             });
             this.peer.on('error', (err) => {
                 console.error(err);
@@ -419,7 +418,7 @@
         }
 
         hostGame() {
-            if (!this.peer.id) {
+            if (!this.peer || !this.peer.id) {
                 this.updateStatus("Инициализация сети...", "waiting");
                 setTimeout(() => this.hostGame(), 500);
                 return;
@@ -428,6 +427,7 @@
             document.getElementById('joinInput').style.display = 'none';
             document.getElementById('myPeerId').innerText = this.peer.id;
             this.updateStatus("Ожидание подключения игрока...", "waiting");
+            this.isHost = true;
         }
 
         joinGame() {
@@ -441,15 +441,18 @@
             if (!remoteId) return;
             this.updateStatus("Подключение...", "waiting");
             const conn = this.peer.connect(remoteId);
+
             conn.on('open', () => {
                 this.conn = conn;
                 this.setupConnection();
                 this.isHost = false;
-                this.myColor = 'black'; // Клиент всегда черный
-                this.updateStatus("Подключено! Вы играете за Черных.", "connected");
-                this.game.startOnlineGame('black');
+                this.myColor = 'black';
+                this.updateStatus("Подключено! Ожидание начала игры...", "connected");
+                this.conn.send({type: 'ready'});
             });
+
             conn.on('error', (err) => {
+                console.error('Connection error:', err);
                 this.updateStatus("Не удалось подключиться", "disconnected");
             });
         }
@@ -458,10 +461,12 @@
             this.conn.on('data', (data) => {
                 this.handleData(data);
             });
+
             this.conn.on('close', () => {
                 this.updateStatus("Соперник отключился", "disconnected");
                 this.conn = null;
-                this.game.isProcessing = true; // Блокируем игру
+                this.game.isProcessing = true;
+                this.gameStarted = false;
             });
         }
 
@@ -470,12 +475,18 @@
                 this.game.receiveMove(data.move);
             } else if (data.type === 'restart') {
                 this.game.reset();
+            } else if (data.type === 'ready' && !this.isHost) {
+                this.game.startOnlineGame('black');
+                this.gameStarted = true;
             }
         }
 
         sendMove(move) {
-            if (this.conn && this.conn.open) {
+            if (this.conn && this.conn.open && this.conn.peerConnection) {
                 this.conn.send({type: 'move', move: move});
+            } else {
+                console.warn('Cannot send move: connection not open');
+                this.updateStatus("Соединение потеряно", "disconnected");
             }
         }
 
@@ -484,6 +495,7 @@
             if (this.peer) this.peer.destroy();
             this.conn = null;
             this.peer = null;
+            this.gameStarted = false;
             document.getElementById('networkPanel').style.display = 'none';
             this.game.wrapper.classList.remove('mode-online');
         }
@@ -515,8 +527,9 @@
             this.selectedPos = null;
             this.validMoves = [];
             this.isProcessing = false;
+            this.isGameOver = false;
             this.botCurrentPiecePos = null;
-            this.myColorOnline = null; // 'white' или 'black' если онлайн
+            this.myColorOnline = null;
             this.network = new NetworkManager(this);
             this.network.init();
             this.init();
@@ -524,7 +537,7 @@
 
         setPlayType(type) {
             this.playType = type;
-            this.wrapper.className = 'game-wrapper'; // сброс классов
+            this.wrapper.className = 'game-wrapper';
             if (type === 'pvp') this.wrapper.classList.add('mode-pvp');
             if (type === 'online') {
                 this.wrapper.classList.add('mode-online');
@@ -539,6 +552,7 @@
         startOnlineGame(color) {
             this.myColorOnline = color;
             this.reset();
+            this.isProcessing = false;
         }
 
         init() {
@@ -549,6 +563,7 @@
             this.updateUI();
             this.modal.style.display = 'none';
             this.isProcessing = false;
+            this.isGameOver = false;
             this.botCurrentPiecePos = null;
             this.selectedPos = null;
             this.validMoves = [];
@@ -578,10 +593,15 @@
         }
 
         reset() {
-            if (this.playType === 'online' && this.network.conn) {
+            if (this.playType === 'online' && this.network.conn && this.network.conn.open) {
                 this.network.conn.send({type: 'restart'});
+                setTimeout(() => {
+                    this.init();
+                    this.isProcessing = false;
+                }, 100);
+            } else {
+                this.init();
             }
-            this.init();
         }
 
         getPieceColor(piece) {
@@ -744,19 +764,24 @@
         }
 
         handleCellClick(r, c) {
-            if (this.isProcessing) return;
-            // Проверка: мой ли сейчас ход в онлайн режиме
+            if (this.isProcessing || this.isGameOver) return;
+
             if (this.playType === 'online') {
-                if ((this.turn === CONSTANTS.WHITE && this.myColorOnline !== 'white') || (this.turn === CONSTANTS.BLACK && this.myColorOnline !== 'black')) {
-                    return; // Не мой ход
+                if ((this.turn === CONSTANTS.WHITE && this.myColorOnline !== 'white') ||
+                    (this.turn === CONSTANTS.BLACK && this.myColorOnline !== 'black')) {
+                    return;
                 }
             } else if (this.playType === 'pve' && this.turn === CONSTANTS.BLACK) {
-                return; // Ход бота
+                return;
             }
+
             const clickedPiece = this.board[r][c];
             const pieceColor = clickedPiece !== CONSTANTS.EMPTY ? this.getPieceColor(clickedPiece) : null;
+
             if (pieceColor !== this.turn && pieceColor !== null) return;
+
             const isOwnPiece = clickedPiece !== CONSTANTS.EMPTY && pieceColor === this.turn;
+
             if (isOwnPiece) {
                 const allMoves = this.getAllMoves(this.board, this.turn);
                 const hasCaptureGlobal = allMoves.some(m => m.isCapture);
@@ -771,6 +796,7 @@
                 this.render();
                 return;
             }
+
             if (clickedPiece === CONSTANTS.EMPTY && this.selectedPos) {
                 const move = this.validMoves.find(m => m.to.r === r && m.to.c === c);
                 if (move) {
@@ -783,9 +809,11 @@
             const piece = this.board[move.from.r][move.from.c];
             this.board[move.to.r][move.to.c] = piece;
             this.board[move.from.r][move.from.c] = CONSTANTS.EMPTY;
+
             if (move.isCapture) {
                 this.board[move.captured.r][move.captured.c] = CONSTANTS.EMPTY;
             }
+
             let promoted = false;
             if (piece === CONSTANTS.WHITE && move.to.r === 0) {
                 this.board[move.to.r][move.to.c] = CONSTANTS.WHITE_KING;
@@ -794,11 +822,11 @@
                 this.board[move.to.r][move.to.c] = CONSTANTS.BLACK_KING;
                 promoted = true;
             }
-            // Отправка хода сопернику
+
             if (!isRemote && this.playType === 'online') {
                 this.network.sendMove(move);
             }
-            // Логика серийных взятий
+
             if (move.isCapture && !promoted) {
                 const followUpMoves = this.getMovesForPiece(this.board, move.to.r, move.to.c, this.board[move.to.r][move.to.c])
                     .filter(m => m.isCapture);
@@ -806,13 +834,10 @@
                     this.selectedPos = {r: move.to.r, c: move.to.c};
                     this.validMoves = followUpMoves;
                     this.render();
-                    // В онлайн режиме серийный ход тоже нужно отправлять?
-                    // Упрощение: считаем серию одним действием для сети или отправляем каждый прыжок.
-                    // Здесь реализуем отправку каждого прыжка рекурсивно в executeMove при следующем клике пользователя.
-                    // Но для простоты сети: если серия, пользователь кликает дальше, и каждый клик триггерит executeMove.
                     return;
                 }
             }
+
             this.selectedPos = null;
             this.validMoves = [];
             this.switchTurn();
@@ -827,6 +852,7 @@
             this.render();
             this.checkWinCondition();
             if (this.isGameOver) return;
+
             if (this.turn === CONSTANTS.BLACK) {
                 if (this.playType === 'pve') {
                     this.isProcessing = true;
@@ -846,12 +872,15 @@
             const whiteMoves = this.getAllMoves(this.board, CONSTANTS.WHITE);
             const blackMoves = this.getAllMoves(this.board, CONSTANTS.BLACK);
             let whiteCount = 0, blackCount = 0;
+
             this.board.forEach(row => row.forEach(p => {
                 if (this.getPieceColor(p) === CONSTANTS.WHITE) whiteCount++;
                 if (this.getPieceColor(p) === CONSTANTS.BLACK) blackCount++;
             }));
+
             this.scoreWEl.innerText = whiteCount;
             this.scoreBEl.innerText = blackCount;
+
             if (blackCount === 0 || (this.turn === CONSTANTS.BLACK && blackMoves.length === 0)) {
                 this.endGame(true);
             } else if (whiteCount === 0 || (this.turn === CONSTANTS.WHITE && whiteMoves.length === 0)) {
@@ -863,6 +892,7 @@
             this.isGameOver = true;
             this.isProcessing = true;
             let msg = "";
+
             if (this.playType === 'online') {
                 const iWon = (whiteWon && this.myColorOnline === 'white') || (!whiteWon && this.myColorOnline === 'black');
                 msg = iWon ? "Вы победили!" : "Вы проиграли!";
@@ -874,6 +904,7 @@
                 msg = whiteWon ? "Вы победили!" : "Бот победил!";
                 document.getElementById('modalTitle').innerText = whiteWon ? "Победа!" : "Поражение";
             }
+
             document.getElementById('modalTitle').style.color = whiteWon ? "#27ae60" : "#c0392b";
             document.getElementById('modalMsg').innerText = msg;
             this.modal.style.display = 'flex';
@@ -891,6 +922,7 @@
                 }
                 return;
             }
+
             if (this.turn === CONSTANTS.WHITE) {
                 this.statusText.innerText = "Ход Белых";
                 this.turnDot.style.background = "white";
@@ -915,25 +947,28 @@
                     const cell = document.createElement('div');
                     cell.className = `cell ${(r + c) % 2 === 0 ? 'light' : 'dark'}`;
                     const isHighlight = this.validMoves.some(m => m.to.r === r && m.to.c === c);
+
                     if (isHighlight) {
                         cell.classList.add('highlight');
                         if (this.selectedPos) {
                             const dist = Math.abs(this.selectedPos.r - r) + Math.abs(this.selectedPos.c - c);
                             if (dist > 2) cell.classList.add('king-move');
                         }
-                        cell.onclick = () => this.handleCellClick(r, c);
-                    } else {
-                        cell.onclick = () => this.handleCellClick(r, c);
                     }
+
+                    cell.onclick = () => this.handleCellClick(r, c);
+
                     const pieceVal = this.board[r][c];
                     if (pieceVal !== CONSTANTS.EMPTY) {
                         const piece = document.createElement('div');
                         piece.className = 'piece';
                         if (this.getPieceColor(pieceVal) === CONSTANTS.WHITE) piece.classList.add('white');
                         else piece.classList.add('black');
+
                         if (pieceVal === CONSTANTS.WHITE_KING || pieceVal === CONSTANTS.BLACK_KING) {
                             piece.classList.add('king');
                         }
+
                         if (this.selectedPos && this.selectedPos.r === r && this.selectedPos.c === c) {
                             piece.classList.add('selected');
                         }
@@ -944,34 +979,91 @@
             }
         }
 
-        // --- BOT LOGIC (сокращено для brevity, аналогично предыдущим версиям) ---
+        // --- BOT LOGIC ---
         botTurn() {
+            if (this.isGameOver) return;
+
             const difficulty = document.getElementById('difficulty').value;
             const moves = this.getAllMoves(this.board, CONSTANTS.BLACK);
-            if (moves.length === 0) return;
-            let chosenMove = moves[Math.floor(Math.random() * moves.length)];
-            if (difficulty === 'medium') {
-                const captures = moves.filter(m => m.isCapture);
-                if (captures.length > 0) chosenMove = captures[Math.floor(Math.random() * captures.length)];
-            } else if (difficulty === 'hard') {
-                chosenMove = this.getBestMoveMinimax(3);
+
+            if (moves.length === 0) {
+                this.switchTurn();
+                return;
             }
-            if (chosenMove) this.executeBotMove(chosenMove);
-            else this.executeBotMove(moves[0]);
+
+            let chosenMove;
+
+            if (difficulty === 'easy') {
+                chosenMove = moves[Math.floor(Math.random() * moves.length)];
+            } else if (difficulty === 'medium') {
+                const captures = moves.filter(m => m.isCapture);
+                if (captures.length > 0) {
+                    chosenMove = captures[Math.floor(Math.random() * captures.length)];
+                } else {
+                    chosenMove = moves[Math.floor(Math.random() * moves.length)];
+                }
+            } else { // hard
+                chosenMove = this.getBestMoveHeuristic(moves);
+            }
+
+            if (chosenMove) {
+                this.executeBotMove(chosenMove);
+            }
+        }
+
+        getBestMoveHeuristic(moves) {
+            let bestMove = moves[0];
+            let bestScore = -Infinity;
+
+            for (const move of moves) {
+                let score = 0;
+
+                // Бонус за взятие
+                if (move.isCapture) {
+                    score += 10;
+
+                    // Дополнительный бонус за взятие дамкой
+                    const piece = this.board[move.from.r][move.from.c];
+                    const isKing = (piece === CONSTANTS.BLACK_KING);
+                    if (isKing) score += 5;
+                }
+
+                // Бонус за продвижение в дамки
+                if (move.to.r === 7 && this.board[move.from.r][move.from.c] === CONSTANTS.BLACK) {
+                    score += 8;
+                }
+
+                // Бонус за движение к центру
+                const centerDist = Math.abs(move.to.c - 3.5);
+                score += (4 - centerDist) * 0.5;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMove = move;
+                }
+            }
+
+            return bestMove;
         }
 
         executeBotMove(move) {
             const piece = this.board[move.from.r][move.from.c];
             this.board[move.to.r][move.to.c] = piece;
             this.board[move.from.r][move.from.c] = CONSTANTS.EMPTY;
-            if (move.isCapture) this.board[move.captured.r][move.captured.c] = CONSTANTS.EMPTY;
+
+            if (move.isCapture) {
+                this.board[move.captured.r][move.captured.c] = CONSTANTS.EMPTY;
+            }
+
             let promoted = false;
             if (piece === CONSTANTS.BLACK && move.to.r === 7) {
                 this.board[move.to.r][move.to.c] = CONSTANTS.BLACK_KING;
                 promoted = true;
             }
+
             if (move.isCapture && !promoted) {
-                const followUpMoves = this.getMovesForPiece(this.board, move.to.r, move.to.c, this.board[move.to.r][move.to.c]).filter(m => m.isCapture);
+                const followUpMoves = this.getMovesForPiece(this.board, move.to.r, move.to.c, this.board[move.to.r][move.to.c])
+                    .filter(m => m.isCapture);
                 if (followUpMoves.length > 0) {
                     this.botCurrentPiecePos = {r: move.to.r, c: move.to.c};
                     this.render();
@@ -979,16 +1071,11 @@
                     return;
                 }
             }
+
             this.botCurrentPiecePos = null;
             this.selectedPos = null;
             this.validMoves = [];
             this.switchTurn();
-        }
-
-        getBestMoveMinimax(depth) {
-            // Упрощенная заглушка для краткости кода, логика та же
-            const moves = this.getAllMoves(this.board, CONSTANTS.BLACK);
-            return moves[0];
         }
     }
 
@@ -996,4 +1083,4 @@
     const network = game.network;
 </script>
 </body>
-</html>
+    </html>
